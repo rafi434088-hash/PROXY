@@ -320,7 +320,7 @@ def serve_http(browser):
 
     if method.upper() == "CONNECT":
         host, port = _split_hostport(target, 443)
-        _bridge(browser, host, port, preface=r.take(), connect=True)
+        ok = _bridge(browser, host, port, preface=r.take(), connect=True)
     else:
         try:
             rest = target.split("://", 1)[1]
@@ -330,7 +330,14 @@ def serve_http(browser):
             browser.close(); return
         req = ("%s /%s HTTP/1.1\r\n" % (method, path)).encode() + b"".join(headers) + b"\r\n"
         # r.take() = any request body already buffered (POST/PUT)
-        _bridge(browser, host, port, preface=req + r.take(), connect=False)
+        ok = _bridge(browser, host, port, preface=req + r.take(), connect=False)
+    if not ok:
+        try:
+            browser.sendall(b"HTTP/1.1 502 Bad Gateway\r\n"
+                            b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+        except OSError:
+            pass
+        browser.close()
 
 
 def _split_hostport(hostport, default_port):
@@ -396,12 +403,13 @@ def _open_retry(host, port, tries=3):
 
 
 def _bridge(browser, host, port, preface, connect, socks_reply=False):
+    # On an open failure return False WITHOUT closing the browser, so the
+    # caller can send a proper error reply (502 / SOCKS error) first.
     if not STATE["endpoint"]:
-        browser.close(); return False
+        return False
     try:
         tunnel, enc, dec, leftover = _open_retry(host, port)
     except OSError:
-        browser.close()
         return False
     try:
         if connect:
@@ -429,10 +437,15 @@ def _bridge(browser, host, port, preface, connect, socks_reply=False):
 def _note_fail():
     with STATE["lock"]:
         STATE["fails"] += 1
-        if STATE["fails"] >= 3:              # endpoint may have moved
+        refresh = STATE["fails"] >= 3        # endpoint may have moved
+        if refresh:
             STATE["fails"] = 0
-            new = live_endpoint()
-            if new and new != STATE["endpoint"]:
+    if not refresh:
+        return
+    new = live_endpoint()                    # network I/O OUTSIDE the lock
+    if new and new != STATE["endpoint"]:
+        with STATE["lock"]:
+            if new != STATE["endpoint"]:
                 say("[*] Endpoint changed -> %s" % new)
                 STATE["endpoint"] = new
 

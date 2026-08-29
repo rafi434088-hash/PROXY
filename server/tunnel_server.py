@@ -31,8 +31,17 @@ BANNER = b"220 mx.tsoolgee.uk ESMTP Postfix (Ubuntu)\r\n"
 
 AUTH_WINDOW = 300
 HANDSHAKE_TIMEOUT = 20      # slowloris guard: the SMTP+key phase must be quick
-RELAY_IDLE = 300            # drop a relay idle this long (frees dead fds)
+RELAY_IDLE = 1800           # generous: don't kill idle keepalive/websocket conns
 MAX_CONNS = 256
+
+
+def _keepalive(sock):
+    """Enable TCP keepalive so a truly dead peer is eventually reaped even
+    with a long idle timeout (covers legitimately-idle long-lived conns)."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        pass
 _sem = threading.Semaphore(MAX_CONNS)
 
 
@@ -225,6 +234,7 @@ def handle(conn, addr):
         # ---- relay: blocking sockets, one thread per direction ----
         conn.settimeout(RELAY_IDLE)
         up.settimeout(RELAY_IDLE)
+        _keepalive(conn); _keepalive(up)
         t = threading.Thread(target=pump, args=(conn, up, dec, leftover), daemon=True)
         t.start()
         pump(up, conn, enc)              # target -> client, in this thread
@@ -251,7 +261,14 @@ def main():
     while True:
         conn, addr = srv.accept()
         _sem.acquire()
-        threading.Thread(target=handle, args=(conn, addr), daemon=True).start()
+        try:
+            threading.Thread(target=handle, args=(conn, addr), daemon=True).start()
+        except RuntimeError:                 # thread/resource exhaustion
+            _sem.release()
+            try:
+                conn.close()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
