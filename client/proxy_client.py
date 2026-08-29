@@ -40,7 +40,7 @@ WORKFLOW = "proxy.yml"
 # Shared tunnel secret - MUST match the repo secret PROXY_SECRET. Injected
 # at build time; the placeholder is replaced by build_exe. Never commit a
 # real value to the public repo.
-SECRET = b"__PROXY_SECRET__"
+SECRET = b"__PROXY_SECRET_PLACEHOLDER__"
 
 DISPATCH_TOKEN = ""          # optional; or token.txt / TSOOLGEE_TOKEN env
 
@@ -144,12 +144,38 @@ def pump(src, dst, cipher, initial=b""):
 
 
 # ------------------------------------------------------------- github discovery
+def tls_context():
+    """Verifying TLS context that also trusts the OS certificate store.
+
+    This network intercepts TLS and re-signs it with a filter CA that
+    lives in the Windows root store. Python's default context does not
+    load that store, so api.github.com fails to verify - load it by hand.
+    """
+    ctx = ssl.create_default_context()
+    try:
+        ctx.load_default_certs(ssl.Purpose.SERVER_AUTH)
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:
+            for cert, enc, trust in ssl.enum_certificates("ROOT"):
+                if enc == "x509_asn" and (trust is True or (
+                        isinstance(trust, set) and ssl.Purpose.SERVER_AUTH.oid in trust)):
+                    try:
+                        ctx.load_verify_locations(cadata=ssl.DER_cert_to_PEM_cert(cert))
+                    except ssl.SSLError:
+                        pass
+        except Exception:
+            pass
+    return ctx
+
+
 def _get(url, token=None, timeout=15):
     h = {"User-Agent": "tsoolgee-proxy", "Accept": "application/vnd.github+json"}
     if token:
         h["Authorization"] = "Bearer " + token
     req = urllib.request.Request(url, headers=h)
-    with urllib.request.urlopen(req, timeout=timeout, context=ssl.create_default_context()) as r:
+    with urllib.request.urlopen(req, timeout=timeout, context=tls_context()) as r:
         return r.status, r.read()
 
 
@@ -170,11 +196,20 @@ def find_token():
 
 
 def live_endpoint():
-    url = "https://api.github.com/repos/%s/%s/contents/endpoint.json?ref=live" % (OWNER, REPO)
+    """Read the endpoint from raw.githubusercontent - a CDN with no API
+    rate limit, so every machine (all sharing one IP behind the filter)
+    can poll it freely. The endpoint is pinned, so ~5 min CDN caching is
+    fine. Falls back to the API only if the CDN read fails."""
+    raw_url = "https://raw.githubusercontent.com/%s/%s/live/endpoint.json" % (OWNER, REPO)
     try:
-        _, raw = _get(url)
-        obj = json.loads(raw)
-        data = base64.b64decode(obj["content"])
+        _, raw = _get(raw_url)
+        return json.loads(raw).get("endpoint")
+    except Exception:
+        pass
+    try:
+        api = "https://api.github.com/repos/%s/%s/contents/endpoint.json?ref=live" % (OWNER, REPO)
+        _, raw = _get(api)
+        data = base64.b64decode(json.loads(raw)["content"])
         return json.loads(data).get("endpoint")
     except Exception:
         return None
@@ -206,7 +241,7 @@ def dispatch():
          "Authorization": "Bearer " + tok}
     try:
         req = urllib.request.Request(url, headers=h, data=body)
-        with urllib.request.urlopen(req, timeout=20, context=ssl.create_default_context()) as r:
+        with urllib.request.urlopen(req, timeout=20, context=tls_context()) as r:
             if r.status in (201, 204):
                 say("[+] Requested a new server run."); return True
     except Exception as e:
@@ -428,7 +463,7 @@ def main():
     say("=" * 58)
     say(" Tsoolgee proxy  -  ESMTP-framed tunnel")
     say("=" * 58)
-    if SECRET == b"__PROXY_SECRET__":
+    if SECRET.startswith(b"__PROXY_SECRET"):
         say("[!] This build has no secret baked in. Rebuild with build_exe.py.")
 
     ep = live_endpoint()

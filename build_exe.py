@@ -23,9 +23,9 @@ def main():
         sys.exit("secret.txt is empty.")
 
     src = open(os.path.join(HERE, "client", "proxy_client.py"), encoding="utf-8").read()
-    if 'b"__PROXY_SECRET__"' not in src:
+    if 'b"__PROXY_SECRET_PLACEHOLDER__"' not in src:
         sys.exit("placeholder not found in client - already injected?")
-    src = src.replace('b"__PROXY_SECRET__"', 'b"%s"' % secret)
+    src = src.replace('b"__PROXY_SECRET_PLACEHOLDER__"', 'b"%s"' % secret)
 
     built_dir = os.path.join(HERE, "_build_src")
     os.makedirs(built_dir, exist_ok=True)
