@@ -1,0 +1,76 @@
+name: SMTP-framed proxy
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    # every 5 hours - keeps a run almost always live (a job lasts up to 6h)
+    - cron: "0 */5 * * *"
+
+concurrency:
+  group: proxy-server
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tune kernel (BBR + big buffers)
+        run: |
+          sudo sysctl -w net.core.default_qdisc=fq || true
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
+          sudo sysctl -w net.ipv4.tcp_fastopen=3 || true
+
+      - name: Download bore
+        run: |
+          curl -L -o bore.tgz https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-unknown-linux-musl.tar.gz
+          tar xzf bore.tgz && chmod +x bore && ./bore --version
+
+      - name: Start tunnel server on :2525
+        env:
+          PROXY_SECRET: ${{ secrets.PROXY_SECRET }}
+        run: |
+          nohup env PROXY_SECRET="$PROXY_SECRET" python3 server/tunnel_server.py 2525 > srv.log 2>&1 &
+          sleep 2
+          ss -ltnp 2>/dev/null | grep ':2525' && echo "server up" || { cat srv.log; exit 1; }
+
+      - name: Open bore tunnel
+        run: |
+          nohup ./bore local 2525 --to bore.pub --port 24601 > bore.log 2>&1 &
+          for i in $(seq 1 30); do
+            EP=$(grep -oE 'bore\.pub:[0-9]+' bore.log | head -1)
+            [ -n "$EP" ] && break; sleep 1
+          done
+          [ -z "$EP" ] && { echo "no endpoint"; cat bore.log; exit 1; }
+          echo "ENDPOINT=$EP"; echo "$EP" > /tmp/ep.txt
+
+      - name: Publish endpoint to 'live' branch
+        run: |
+          git config user.name  proxy-bot
+          git config user.email proxy-bot@users.noreply.github.com
+          printf '{"endpoint":"%s","updated":"%s"}\n' "$(cat /tmp/ep.txt)" "$(date -u +%FT%TZ)" > /tmp/endpoint.json
+          git checkout --orphan live
+          git reset >/dev/null 2>&1 || true
+          cp /tmp/endpoint.json endpoint.json
+          git add -f endpoint.json
+          git commit -m "endpoint $(cat /tmp/ep.txt)" >/dev/null
+          git push -f origin live
+          git checkout -f main
+          echo "published $(cat /tmp/ep.txt)"
+
+      - name: Keep alive (~5h50m) + restart on death
+        env:
+          PROXY_SECRET: ${{ secrets.PROXY_SECRET }}
+        run: |
+          for i in $(seq 1 350); do
+            pgrep -f "bore local 2525"      >/dev/null || { echo cf-restart; nohup ./bore local 2525 --to bore.pub --port 24601 >> bore.log 2>&1 & }
+            pgrep -f "tunnel_server.py"     >/dev/null || { echo srv-restart; nohup env PROXY_SECRET="$PROXY_SECRET" python3 server/tunnel_server.py 2525 >> srv.log 2>&1 & }
+            sleep 60
+          done
+          echo "==== srv.log tail ===="; tail -60 srv.log
