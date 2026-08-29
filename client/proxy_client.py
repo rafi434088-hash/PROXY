@@ -62,25 +62,19 @@ def say(m=""):
 
 # ------------------------------------------------------------- crypto / io
 class Stream:
+    # big-int XOR keystream - ~10x faster than a per-byte loop, same bytes
     def __init__(self, key):
         self.key = key; self.ctr = 0; self.buf = b""
 
-    def _block(self):
-        b = hashlib.sha256(self.key + struct.pack(">Q", self.ctr)).digest()
-        self.ctr += 1
-        return b
-
     def xor(self, data):
-        out = bytearray(data); buf = self.buf; i = 0
-        while i < len(out):
-            if not buf:
-                buf = self._block()
-            n = min(len(buf), len(out) - i)
-            for j in range(n):
-                out[i + j] ^= buf[j]
-            buf = buf[n:]; i += n
-        self.buf = buf
-        return bytes(out)
+        n = len(data)
+        if not n:
+            return b""
+        while len(self.buf) < n:
+            self.buf += hashlib.sha256(self.key + struct.pack(">Q", self.ctr)).digest()
+            self.ctr += 1
+        ks = self.buf[:n]; self.buf = self.buf[n:]
+        return (int.from_bytes(data, "big") ^ int.from_bytes(ks, "big")).to_bytes(n, "big")
 
 
 class BufReader:
