@@ -220,7 +220,7 @@ def handle(conn, addr):
         if sa is None:
             conn.sendall(enc.xor(b"ERR blocked\n")); return
         try:
-            up = socket.create_connection(sa, timeout=15)
+            up = socket.create_connection(sa, timeout=10)
             up.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError as e:
             conn.sendall(enc.xor(b"ERR %s\n" % str(e).encode()[:60])); return
