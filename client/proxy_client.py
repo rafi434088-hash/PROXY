@@ -4,17 +4,19 @@
 
 Listens locally as an HTTP and SOCKS5 proxy for the browser, and carries
 every connection to the GitHub-Actions server over a connection that
-opens as an ordinary ESMTP session (so the NetFree filter lets it
-through) and then becomes our encrypted tunnel.
+opens as an ordinary ESMTP session (so a DPI filter lets it through) and
+then becomes an encrypted tunnel.
 
   HTTP   127.0.0.1:10809   <- point the browser / ZeroOmega here
   SOCKS5 127.0.0.1:10808
 
-Startup:
-  * find the live server endpoint from the public 'live' branch
-    (no token needed - the repo is public);
-  * if no run is active and a dispatch token is available, start one;
-  * many machines can run this at once against the same run.
+Startup finds the live server endpoint from the public 'live' branch (no
+token needed); if no run is active and a dispatch token is present it
+starts one. Many machines can run this at once against the same run.
+
+Honest security note: the tunnel secret is symmetric and baked into this
+client, so it protects against the filter and casual abuse, not against
+someone who has the client. Real browsing is HTTPS end to end.
 """
 
 import base64
@@ -22,7 +24,6 @@ import hashlib
 import hmac
 import json
 import os
-import select
 import socket
 import ssl
 import struct
@@ -36,16 +37,12 @@ OWNER = "rafi434088-hash"
 REPO = "PROXY"
 WORKFLOW = "proxy.yml"
 
-# Shared tunnel secret. MUST match the repo secret PROXY_SECRET. It only
-# gates use of the proxy and encrypts the hop to the server - it is not a
-# GitHub credential.
-SECRET = b"25000c8a3bf79aea8faf3a7fba5110c17b669a6a0b546ff1"
+# Shared tunnel secret - MUST match the repo secret PROXY_SECRET. Injected
+# at build time; the placeholder is replaced by build_exe. Never commit a
+# real value to the public repo.
+SECRET = b"__PROXY_SECRET__"
 
-# Optional GitHub token, ONLY used to start a run on demand when none is
-# live (workflow_dispatch). Leave empty to rely on the cron schedule.
-# Put a fine-grained PAT (this repo, Actions: read+write) here or in
-# token.txt next to the exe, or the TSOOLGEE_TOKEN env var.
-DISPATCH_TOKEN = ""
+DISPATCH_TOKEN = ""          # optional; or token.txt / TSOOLGEE_TOKEN env
 
 HTTP_PORT = 10809
 SOCKS_PORT = 10808
@@ -63,7 +60,7 @@ def say(m=""):
         print(m.encode("ascii", "replace").decode("ascii"), flush=True)
 
 
-# ------------------------------------------------------------- crypto
+# ------------------------------------------------------------- crypto / io
 class Stream:
     def __init__(self, key):
         self.key = key; self.ctr = 0; self.buf = b""
@@ -86,16 +83,67 @@ class Stream:
         return bytes(out)
 
 
+class BufReader:
+    def __init__(self, sock):
+        self.s = sock; self.buf = b""
+
+    def _fill(self):
+        d = self.s.recv(65536)
+        if not d:
+            raise EOFError
+        self.buf += d
+
+    def readline(self, limit=8192):
+        while b"\n" not in self.buf:
+            if len(self.buf) > limit:
+                break
+            self._fill()
+        i = self.buf.find(b"\n")
+        if i < 0:
+            line, self.buf = self.buf, b""
+            return line
+        line, self.buf = self.buf[:i + 1], self.buf[i + 1:]
+        return line
+
+    def read_exact(self, n):
+        while len(self.buf) < n:
+            self._fill()
+        d, self.buf = self.buf[:n], self.buf[n:]
+        return d
+
+    def take(self):
+        d, self.buf = self.buf, b""
+        return d
+
+
 def derive(ns, nc, tag):
     return hashlib.sha256(SECRET + tag + ns + nc).digest()
 
 
 def auth_token():
-    bucket = int(time.time() // AUTH_WINDOW)
-    return hmac.new(SECRET, b"auth" + str(bucket).encode(), hashlib.sha256).hexdigest()
+    b = int(time.time() // AUTH_WINDOW)
+    return hmac.new(SECRET, b"auth" + str(b).encode(), hashlib.sha256).hexdigest()
 
 
-# ------------------------------------------------------------- endpoint discovery
+def pump(src, dst, cipher, initial=b""):
+    try:
+        if initial:
+            dst.sendall(initial)
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(cipher.xor(data))
+    except OSError:
+        pass
+    finally:
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------- github discovery
 def _get(url, token=None, timeout=15):
     h = {"User-Agent": "tsoolgee-proxy", "Accept": "application/vnd.github+json"}
     if token:
@@ -122,7 +170,6 @@ def find_token():
 
 
 def live_endpoint():
-    """Read bore.pub:PORT from the public 'live' branch. No auth needed."""
     url = "https://api.github.com/repos/%s/%s/contents/endpoint.json?ref=live" % (OWNER, REPO)
     try:
         _, raw = _get(url)
@@ -150,7 +197,7 @@ def dispatch():
     tok = find_token()
     if not tok:
         say("[!] No run live and no dispatch token - waiting for the schedule.")
-        say("    (add a fine-grained PAT to token.txt to start on demand)")
+        say("    (drop a fine-grained PAT into token.txt to start on demand)")
         return False
     url = ("https://api.github.com/repos/%s/%s/actions/workflows/%s/dispatches"
            % (OWNER, REPO, WORKFLOW))
@@ -168,94 +215,61 @@ def dispatch():
 
 
 # ------------------------------------------------------------- tunnel
+STATE = {"endpoint": None, "fails": 0, "lock": threading.Lock()}
+
+
 def open_tunnel(endpoint, host, port):
-    """Open one SMTP-framed encrypted tunnel to `host:port` via the server."""
+    """Open one SMTP-framed encrypted tunnel to host:port. Returns
+    (sock, enc, dec, leftover) where leftover is plaintext already read
+    past the server's OK line (usually empty)."""
     bhost, bport = endpoint.rsplit(":", 1)
     s = socket.create_connection((bhost, int(bport)), timeout=15)
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    s.settimeout(20)                       # bound the whole SMTP+key handshake
-    f = s.makefile("rb")
-    if not f.readline().startswith(b"220"):
-        s.close(); raise OSError("no SMTP banner")
-    s.sendall(b"EHLO tsoolgee\r\n")
-    while True:
-        line = f.readline()
-        if not line:
-            s.close(); raise OSError("EHLO failed")
-        if line[3:4] == b" ":
-            break
-    s.sendall(b"AUTH PLAIN %s\r\n" % auth_token().encode())
-    if not f.readline().startswith(b"235"):
-        s.close(); raise OSError("auth rejected")
-    # key exchange
-    ns = _recv_exact(s, 16)
-    if not ns:
-        s.close(); raise OSError("no server nonce")
-    nc = os.urandom(16)
-    s.sendall(nc)
-    enc = Stream(derive(ns, nc, b"C2S"))   # client -> server
-    dec = Stream(derive(ns, nc, b"S2C"))   # server -> client
-    s.sendall(enc.xor(b"CONNECT %s:%d\n" % (host.encode(), port)))
-    reply = b""
-    while b"\n" not in reply and len(reply) < 200:
-        chunk = s.recv(64)
-        if not chunk:
-            s.close(); raise OSError("no CONNECT reply")
-        reply += dec.xor(chunk)
-    if not reply.startswith(b"OK"):
-        s.close(); raise OSError("server: %s" % reply.split(b"\n")[0].decode("ascii", "ignore"))
-    s.settimeout(None)                     # blocking for the relay phase
-    return s, enc, dec
-
-
-def _recv_exact(s, n):
-    buf = b""
-    while len(buf) < n:
-        c = s.recv(n - len(buf))
-        if not c:
-            return None
-        buf += c
-    return buf
-
-
-def splice(browser, tunnel, enc, dec):
-    browser.setblocking(False); tunnel.setblocking(False)
+    s.settimeout(20)
+    r = BufReader(s)
     try:
+        if not r.readline().startswith(b"220"):
+            raise OSError("no SMTP banner")
+        s.sendall(b"EHLO tsoolgee\r\n")
         while True:
-            r, _, x = select.select([browser, tunnel], [], [browser, tunnel], 120)
-            if x or not r:
-                if x:
-                    break
-                continue
-            for s in r:
-                try:
-                    data = s.recv(65536)
-                except (BlockingIOError, InterruptedError):
-                    continue
-                except OSError:
-                    return
-                if not data:
-                    return
-                if s is browser:
-                    tunnel.sendall(enc.xor(data))
-                else:
-                    browser.sendall(dec.xor(data))
-    finally:
-        for s in (browser, tunnel):
-            try:
-                s.close()
-            except OSError:
-                pass
+            line = r.readline()
+            if not line:
+                raise OSError("EHLO failed")
+            if line[3:4] == b" " or line[3:4] == b"":
+                break
+        s.sendall(b"AUTH PLAIN %s\r\n" % auth_token().encode())
+        if not r.readline().startswith(b"235"):
+            raise OSError("auth rejected")
+        # key exchange - all through the same reader
+        nonce_s = r.read_exact(16)
+        nonce_c = os.urandom(16)
+        s.sendall(nonce_c)
+        enc = Stream(derive(nonce_s, nonce_c, b"C2S"))
+        dec = Stream(derive(nonce_s, nonce_c, b"S2C"))
+        s.sendall(enc.xor(b"CONNECT %s:%d\n" % (host.encode(), port)))
+        acc = dec.xor(r.take())
+        while b"\n" not in acc and len(acc) < 256:
+            chunk = s.recv(128)
+            if not chunk:
+                raise OSError("no CONNECT reply")
+            acc += dec.xor(chunk)
+        head, _, leftover = acc.partition(b"\n")
+        if not head.startswith(b"OK"):
+            raise OSError("server: %s" % head.decode("ascii", "ignore"))
+        s.settimeout(None)
+        return s, enc, dec, leftover
+    except Exception:
+        try:
+            s.close()
+        except OSError:
+            pass
+        raise
 
 
-# ------------------------------------------------------------- local proxy fronts
-STATE = {"endpoint": None}
-
-
+# ------------------------------------------------------------- local fronts
 def serve_http(browser):
-    """Absolute-form and CONNECT HTTP proxy."""
-    f = browser.makefile("rb")
-    first = f.readline()
+    r = BufReader(browser)
+    first = r.readline()
     if not first:
         browser.close(); return
     try:
@@ -264,16 +278,15 @@ def serve_http(browser):
         browser.close(); return
     headers = []
     while True:
-        h = f.readline()
+        h = r.readline()
         if h in (b"\r\n", b"\n", b""):
             break
         headers.append(h)
 
     if method.upper() == "CONNECT":
         host, port = _split_hostport(target, 443)
-        _bridge(browser, host, port, preface=b"", connect=True)
+        _bridge(browser, host, port, preface=r.take(), connect=True)
     else:
-        # absolute URI: http://host[:port]/path
         try:
             rest = target.split("://", 1)[1]
             hostport, _, path = rest.partition("/")
@@ -281,12 +294,12 @@ def serve_http(browser):
         except Exception:
             browser.close(); return
         req = ("%s /%s HTTP/1.1\r\n" % (method, path)).encode() + b"".join(headers) + b"\r\n"
-        _bridge(browser, host, port, preface=req, connect=False)
+        # r.take() = any request body already buffered (POST/PUT)
+        _bridge(browser, host, port, preface=req + r.take(), connect=False)
 
 
 def _split_hostport(hostport, default_port):
-    """Split 'host' or 'host:port' safely (no colon -> default port)."""
-    if hostport.startswith("["):                      # [ipv6]:port
+    if hostport.startswith("["):
         h, _, rest = hostport[1:].partition("]")
         p = rest.lstrip(":")
         return h, int(p) if p else default_port
@@ -297,29 +310,26 @@ def _split_hostport(hostport, default_port):
 
 
 def serve_socks(browser):
-    """Minimal SOCKS5 (CONNECT, no auth)."""
-    d = _recv_exact(browser, 2)
-    if not d or d[0] != 5:
+    r = BufReader(browser)
+    head = r.read_exact(2)
+    if head[0] != 5:
         browser.close(); return
-    nm = d[1]
-    _recv_exact(browser, nm)
-    browser.sendall(b"\x05\x00")               # no auth
-    hdr = _recv_exact(browser, 4)
-    if not hdr or hdr[1] != 1:                  # only CONNECT
+    r.read_exact(head[1])                       # methods
+    browser.sendall(b"\x05\x00")
+    req = r.read_exact(4)
+    if req[1] != 1:                             # CONNECT only
         browser.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00"); browser.close(); return
-    atyp = hdr[3]
+    atyp = req[3]
     if atyp == 1:
-        host = socket.inet_ntoa(_recv_exact(browser, 4))
+        host = socket.inet_ntoa(r.read_exact(4))
     elif atyp == 3:
-        ln = _recv_exact(browser, 1)[0]
-        host = _recv_exact(browser, ln).decode("latin-1")
+        host = r.read_exact(r.read_exact(1)[0]).decode("latin-1")
     elif atyp == 4:
-        host = socket.inet_ntop(socket.AF_INET6, _recv_exact(browser, 16))
+        host = socket.inet_ntop(socket.AF_INET6, r.read_exact(16))
     else:
         browser.close(); return
-    port = struct.unpack("!H", _recv_exact(browser, 2))[0]
-    ok = _bridge(browser, host, port, preface=b"", connect=False, socks_reply=True)
-    if not ok:
+    port = struct.unpack("!H", r.read_exact(2))[0]
+    if not _bridge(browser, host, port, preface=r.take(), connect=False, socks_reply=True):
         try:
             browser.sendall(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
         except OSError:
@@ -327,22 +337,69 @@ def serve_socks(browser):
         browser.close()
 
 
+def _open_retry(host, port, tries=3):
+    """Tunnel-open with a couple of quick retries. The bore free relay
+    occasionally drops a handshake; a retry almost always succeeds and
+    keeps a page's many parallel connections from failing under load."""
+    last = None
+    for i in range(tries):
+        ep = STATE["endpoint"]
+        if not ep:
+            break
+        try:
+            t = open_tunnel(ep, host, port)
+            with STATE["lock"]:
+                STATE["fails"] = 0             # healthy again
+            return t
+        except OSError as e:
+            last = e
+            _note_fail()
+            time.sleep(0.25 * (i + 1))
+    if last:
+        raise last
+    raise OSError("no endpoint")
+
+
 def _bridge(browser, host, port, preface, connect, socks_reply=False):
-    ep = STATE["endpoint"]
-    if not ep:
+    if not STATE["endpoint"]:
         browser.close(); return False
     try:
-        tunnel, enc, dec = open_tunnel(ep, host, port)
+        tunnel, enc, dec, leftover = _open_retry(host, port)
     except OSError:
+        browser.close()
         return False
-    if connect:
-        browser.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-    if socks_reply:
-        browser.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
-    if preface:
-        tunnel.sendall(enc.xor(preface))
-    splice(browser, tunnel, enc, dec)
+    try:
+        if connect:
+            browser.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        if socks_reply:
+            browser.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+        if leftover:
+            browser.sendall(leftover)
+        # relay: browser<->tunnel, blocking, one thread per direction.
+        # `preface` is plaintext from the browser side, so it must be
+        # encrypted before it goes into the tunnel (pump sends initial raw).
+        t = threading.Thread(target=pump, args=(browser, tunnel, enc, enc.xor(preface)), daemon=True)
+        t.start()
+        pump(tunnel, browser, dec)
+        t.join(timeout=5)
+    finally:
+        for s in (browser, tunnel):
+            try:
+                s.close()
+            except OSError:
+                pass
     return True
+
+
+def _note_fail():
+    with STATE["lock"]:
+        STATE["fails"] += 1
+        if STATE["fails"] >= 3:              # endpoint may have moved
+            STATE["fails"] = 0
+            new = live_endpoint()
+            if new and new != STATE["endpoint"]:
+                say("[*] Endpoint changed -> %s" % new)
+                STATE["endpoint"] = new
 
 
 def listener(port, handler):
@@ -371,6 +428,8 @@ def main():
     say("=" * 58)
     say(" Tsoolgee proxy  -  ESMTP-framed tunnel")
     say("=" * 58)
+    if SECRET == b"__PROXY_SECRET__":
+        say("[!] This build has no secret baked in. Rebuild with build_exe.py.")
 
     ep = live_endpoint()
     if not ep:
@@ -388,15 +447,10 @@ def main():
             time.sleep(10)
     if not ep:
         say("[!] No server endpoint available. Check the Actions tab.")
-        try:
-            input("Press Enter to exit ...")
-        except (EOFError, OSError):
-            pass
-        return 1
+        _pause(); return 1
     STATE["endpoint"] = ep
     say("[+] Server endpoint: %s" % ep)
 
-    # quick self-check: real traffic through the tunnel
     ip = _selftest()
     if ip:
         say("[+] Verified: traffic exits from %s" % ip)
@@ -420,25 +474,19 @@ def main():
 
 
 def _selftest():
-    """Fetch our public IP over plain HTTP through the tunnel.
-
-    No TLS here on purpose - the client never does TLS. Real browser
-    traffic is HTTPS that the browser terminates end-to-end; we only
-    relay its bytes. This check just proves the tunnel carries traffic
-    and reports the exit IP.
-    """
-    for host in ("api.ipify.org", "ifconfig.me"):
-        path = "/" if host == "api.ipify.org" else "/ip"
+    """Fetch our public IP over plain HTTP through the tunnel (no TLS in
+    the client on purpose - the browser terminates real HTTPS end to end)."""
+    for host, path in (("api.ipify.org", "/"), ("ifconfig.me", "/ip")):
         try:
-            t, enc, dec = open_tunnel(STATE["endpoint"], host, 80)
+            t, enc, dec, leftover = open_tunnel(STATE["endpoint"], host, 80)
         except OSError:
             continue
         try:
             req = ("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: curl/8\r\n"
                    "Connection: close\r\n\r\n" % (path, host)).encode()
             t.sendall(enc.xor(req))
-            data = b""
             t.settimeout(20)
+            data = leftover
             while len(data) < 8192:
                 chunk = t.recv(4096)
                 if not chunk:
@@ -456,6 +504,13 @@ def _selftest():
             except OSError:
                 pass
     return None
+
+
+def _pause():
+    try:
+        input("Press Enter to exit ...")
+    except (EOFError, OSError):
+        pass
 
 
 if __name__ == "__main__":

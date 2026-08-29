@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
 token.txt
+secret.txt
 build/
 dist/
+_build_src/
+*.spec
