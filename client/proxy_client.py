@@ -473,39 +473,40 @@ def main():
     if SECRET.startswith(b"__PROXY_SECRET"):
         say("[!] This build has no secret baked in. Rebuild with build_exe.py.")
 
+    # The 'live' branch keeps the last endpoint even after a run ends, so
+    # "have an endpoint" does NOT mean "server is up". Test whether the
+    # tunnel actually works; only if it doesn't AND no run is active do we
+    # start one. This makes the exe self-healing when the server is down.
     ep = live_endpoint()
-    if not ep:
+    if ep:
+        STATE["endpoint"] = ep
+
+    ip = STATE["endpoint"] and _selftest() or None
+    if not ip:
         if run_active():
-            say("[*] A run is starting - waiting for its endpoint ...")
+            say("[*] A run is active but not answering yet - waiting ...")
         else:
-            say("[*] No live run - trying to start one ...")
-            dispatch()
+            say("[*] No active server run - starting one ...")
+            if not dispatch():
+                say("    (no dispatch token: waiting for the 5h schedule, or")
+                say("     run it yourself at github.com/%s/%s/actions)" % (OWNER, REPO))
+        # wait for the server to come up, refreshing the endpoint as we go
         for i in range(90):
-            ep = live_endpoint()
-            if ep:
-                break
+            fresh = live_endpoint()
+            if fresh:
+                STATE["endpoint"] = fresh
+            if STATE["endpoint"]:
+                ip = _selftest()
+                if ip:
+                    break
             if i % 3 == 0:
                 say("    ... waiting for server (%ds)" % (i * 10))
             time.sleep(10)
-    if not ep:
+
+    if not STATE["endpoint"]:
         say("[!] No server endpoint available. Check the Actions tab.")
         _pause(); return 1
-    STATE["endpoint"] = ep
-    say("[+] Server endpoint: %s" % ep)
-
-    # self-check with a few retries (the server may be mid-restart during a
-    # cron/deploy handover, when bore is up but the origin is briefly gone)
-    ip = None
-    for attempt in range(6):
-        ip = _selftest()
-        if ip:
-            break
-        if attempt == 0:
-            say("[*] Server not answering yet (may be restarting) - retrying ...")
-        time.sleep(5)
-        fresh = live_endpoint()          # endpoint may have moved
-        if fresh:
-            STATE["endpoint"] = fresh
+    say("[+] Server endpoint: %s" % STATE["endpoint"])
     if ip:
         say("[+] Verified: traffic exits from %s" % ip)
     else:
