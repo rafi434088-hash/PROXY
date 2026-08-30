@@ -76,7 +76,7 @@ class BufReader:
     def _fill(self):
         d = self.s.recv(65536)
         if not d:
-            raise EOFError
+            raise ConnectionError("peer closed")   # OSError subclass
         self.buf += d
 
     def readline(self, limit=2048):

@@ -84,7 +84,7 @@ class BufReader:
     def _fill(self):
         d = self.s.recv(65536)
         if not d:
-            raise EOFError
+            raise ConnectionError("peer closed")   # OSError subclass: caught everywhere
         self.buf += d
 
     def readline(self, limit=8192):
@@ -493,11 +493,24 @@ def main():
     STATE["endpoint"] = ep
     say("[+] Server endpoint: %s" % ep)
 
-    ip = _selftest()
+    # self-check with a few retries (the server may be mid-restart during a
+    # cron/deploy handover, when bore is up but the origin is briefly gone)
+    ip = None
+    for attempt in range(6):
+        ip = _selftest()
+        if ip:
+            break
+        if attempt == 0:
+            say("[*] Server not answering yet (may be restarting) - retrying ...")
+        time.sleep(5)
+        fresh = live_endpoint()          # endpoint may have moved
+        if fresh:
+            STATE["endpoint"] = fresh
     if ip:
         say("[+] Verified: traffic exits from %s" % ip)
     else:
-        say("[!] Tunnel up but self-check did not confirm traffic yet.")
+        say("[!] Could not confirm traffic yet - starting anyway; it will")
+        say("    connect as soon as the server is reachable.")
 
     say("-" * 58)
     say(" HTTP   127.0.0.1:%d   <- point the browser here" % HTTP_PORT)
@@ -560,3 +573,9 @@ if __name__ == "__main__":
         sys.exit(main())
     except KeyboardInterrupt:
         sys.exit(0)
+    except Exception as e:
+        # never vanish with a traceback on a double-clicked exe
+        say("")
+        say("[!] Unexpected error: %s: %s" % (type(e).__name__, e))
+        _pause()
+        sys.exit(1)
