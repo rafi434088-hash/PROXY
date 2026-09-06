@@ -10,7 +10,10 @@ on:
 
 concurrency:
   group: proxy-server
-  cancel-in-progress: true
+  # false, so a new run QUEUES behind the running server instead of
+  # killing it. The old run keeps serving until it ends (~5h50m), then
+  # the queued run takes over - near-continuous, no restart gaps.
+  cancel-in-progress: false
 
 permissions:
   contents: write
