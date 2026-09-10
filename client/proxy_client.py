@@ -10,9 +10,10 @@ then becomes an encrypted tunnel.
   HTTP   127.0.0.1:10809   <- point the browser / ZeroOmega here
   SOCKS5 127.0.0.1:10808
 
-Startup finds the live server endpoint from the public 'live' branch (no
-token needed); if no run is active and a dispatch token is present it
-starts one. Many machines can run this at once against the same run.
+Startup reads the live server endpoint from the public 'live' branch (no
+token needed) and connects straight away. The server is always running,
+so this client never starts a run or checks run status. Many machines
+can run this at once against the same run.
 
 Honest security note: the tunnel secret is symmetric and baked into this
 client, so it protects against the filter and casual abuse, not against
@@ -35,22 +36,28 @@ import urllib.request
 # ------------------------------------------------------------- configuration
 OWNER = "rafi434088-hash"
 REPO = "PROXY"
-WORKFLOW = "proxy.yml"
+
+# The workflow pins bore to this port (bore local ... --port 24601), so the
+# endpoint is almost always this. Used as a last-resort default when GitHub
+# can't be reached (e.g. during a DNS/connectivity blip) so the client can
+# still connect straight to the already-running server instead of hanging.
+DEFAULT_ENDPOINT = "bore.pub:24601"
 
 # Shared tunnel secret - MUST match the repo secret PROXY_SECRET. Injected
 # at build time; the placeholder is replaced by build_exe. Never commit a
 # real value to the public repo.
 SECRET = b"__PROXY_SECRET_PLACEHOLDER__"
 
-DISPATCH_TOKEN = ""          # optional; or token.txt / TSOOLGEE_TOKEN env
-
 HTTP_PORT = 10809
 SOCKS_PORT = 10808
 AUTH_WINDOW = 300
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
-FROZEN = getattr(sys, "frozen", False)
-SIDECAR = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
+# Where we remember the last good endpoint + resolved IP, so a fresh start
+# during a blip doesn't need GitHub or DNS at all.
+_FROZEN = getattr(sys, "frozen", False)
+_HERE = os.path.dirname(sys.executable if _FROZEN else os.path.abspath(__file__))
+CACHE_PATH = os.path.join(_HERE, "proxy_cache.json")
 
 
 def say(m=""):
@@ -173,22 +180,6 @@ def _get(url, token=None, timeout=15):
         return r.status, r.read()
 
 
-def find_token():
-    if DISPATCH_TOKEN.strip():
-        return DISPATCH_TOKEN.strip()
-    for env in ("TSOOLGEE_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"):
-        v = os.environ.get(env, "").strip()
-        if v:
-            return v
-    tf = os.path.join(SIDECAR, "token.txt")
-    if os.path.exists(tf):
-        try:
-            return open(tf, encoding="utf-8").read().strip()
-        except OSError:
-            pass
-    return ""
-
-
 def live_endpoint():
     """Read the endpoint from raw.githubusercontent - a CDN with no API
     rate limit, so every machine (all sharing one IP behind the filter)
@@ -209,42 +200,91 @@ def live_endpoint():
         return None
 
 
-def run_active():
-    url = ("https://api.github.com/repos/%s/%s/actions/workflows/%s/runs?per_page=10"
-           % (OWNER, REPO, WORKFLOW))
-    try:
-        _, raw = _get(url)
-        for run in json.loads(raw).get("workflow_runs", []):
-            if run.get("status") in ("in_progress", "queued", "waiting", "requested", "pending"):
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def dispatch():
-    tok = find_token()
-    if not tok:
-        say("[!] No run live and no dispatch token - waiting for the schedule.")
-        say("    (drop a fine-grained PAT into token.txt to start on demand)")
-        return False
-    url = ("https://api.github.com/repos/%s/%s/actions/workflows/%s/dispatches"
-           % (OWNER, REPO, WORKFLOW))
-    body = json.dumps({"ref": "main"}).encode()
-    h = {"User-Agent": "tsoolgee-proxy", "Accept": "application/vnd.github+json",
-         "Authorization": "Bearer " + tok}
-    try:
-        req = urllib.request.Request(url, headers=h, data=body)
-        with urllib.request.urlopen(req, timeout=20, context=tls_context()) as r:
-            if r.status in (201, 204):
-                say("[+] Requested a new server run."); return True
-    except Exception as e:
-        say("[!] dispatch failed: %s" % e)
-    return False
-
-
 # ------------------------------------------------------------- tunnel
-STATE = {"endpoint": None, "fails": 0, "lock": threading.Lock()}
+STATE = {"endpoint": None, "fails": 0, "lock": threading.Lock(),
+         "dns_host": None, "dns_addrs": []}
+
+
+def load_cache():
+    """Load the last good endpoint + resolved IP from disk, so a cold start
+    during a blip can connect without touching GitHub or DNS."""
+    try:
+        with open(CACHE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return
+    restored = []
+    for item in data.get("dns_addrs") or []:
+        try:
+            fam, sa = item
+            restored.append((int(fam), tuple(sa)))
+        except (ValueError, TypeError):
+            pass
+    with STATE["lock"]:
+        if data.get("endpoint") and not STATE["endpoint"]:
+            STATE["endpoint"] = data["endpoint"]
+        if data.get("dns_host") and restored:
+            STATE["dns_host"] = data["dns_host"]
+            STATE["dns_addrs"] = restored
+
+
+def save_cache():
+    """Best-effort persist of endpoint + resolved IP (atomic replace)."""
+    with STATE["lock"]:
+        data = {"endpoint": STATE["endpoint"], "dns_host": STATE["dns_host"],
+                "dns_addrs": [[fam, list(sa)] for fam, sa in STATE["dns_addrs"]]}
+    try:
+        tmp = CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, CACHE_PATH)
+    except OSError:
+        pass
+
+
+def _connect_pinned(bhost, bport):
+    """Connect to bhost:bport, but remember the last IP that resolved while
+    the network was healthy and reuse it when DNS is down.
+
+    Some connectivity drops only break the DNS resolver: already-open
+    sockets keep working, but a NEW connection can't translate the name.
+    MicroSIP survives those because it dials a fixed server IP. We do the
+    same - resolve once when we can, cache it (to disk too), and on a later
+    DNS failure fall back to the cached IP so a fresh tunnel still opens."""
+    addrs = []
+    fresh = False
+    try:
+        for fam, _, _, _, sa in socket.getaddrinfo(bhost, bport, type=socket.SOCK_STREAM):
+            addrs.append((fam, sa))
+        if addrs:                              # fresh resolve worked - cache it
+            fresh = True
+            with STATE["lock"]:
+                STATE["dns_host"] = bhost
+                STATE["dns_addrs"] = addrs
+    except socket.gaierror:
+        with STATE["lock"]:                    # DNS down - use the last good IP
+            if STATE["dns_host"] == bhost:
+                addrs = list(STATE["dns_addrs"])
+        if addrs:
+            say("[*] DNS lookup failed - connecting by cached IP (%s)" % addrs[0][1][0])
+    if not addrs:
+        raise OSError("cannot resolve %s (no cached IP yet)" % bhost)
+    if fresh:
+        save_cache()
+    last = None
+    for fam, sa in addrs:
+        try:
+            s = socket.socket(fam, socket.SOCK_STREAM)
+            s.settimeout(15)
+            s.connect(sa)
+            return s
+        except OSError as e:
+            last = e
+            try:
+                s.close()
+            except OSError:
+                pass
+    raise last or OSError("connect failed to %s" % bhost)
 
 
 def open_tunnel(endpoint, host, port):
@@ -252,7 +292,7 @@ def open_tunnel(endpoint, host, port):
     (sock, enc, dec, leftover) where leftover is plaintext already read
     past the server's OK line (usually empty)."""
     bhost, bport = endpoint.rsplit(":", 1)
-    s = socket.create_connection((bhost, int(bport)), timeout=15)
+    s = _connect_pinned(bhost, int(bport))
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     s.settimeout(20)
     r = BufReader(s)
@@ -442,6 +482,11 @@ def _note_fail():
             if new != STATE["endpoint"]:
                 say("[*] Endpoint changed -> %s" % new)
                 STATE["endpoint"] = new
+                changed = True
+            else:
+                changed = False
+        if changed:
+            save_cache()
 
 
 def listener(port, handler):
@@ -473,40 +518,27 @@ def main():
     if SECRET.startswith(b"__PROXY_SECRET"):
         say("[!] This build has no secret baked in. Rebuild with build_exe.py.")
 
-    # The 'live' branch keeps the last endpoint even after a run ends, so
-    # "have an endpoint" does NOT mean "server is up". Test whether the
-    # tunnel actually works; only if it doesn't AND no run is active do we
-    # start one. This makes the exe self-healing when the server is down.
-    ep = live_endpoint()
-    if ep:
-        STATE["endpoint"] = ep
-
-    ip = STATE["endpoint"] and _selftest() or None
-    if not ip:
-        if run_active():
-            say("[*] A run is active but not answering yet - waiting ...")
-        else:
-            say("[*] No active server run - starting one ...")
-            if not dispatch():
-                say("    (no dispatch token: waiting for the 5h schedule, or")
-                say("     run it yourself at github.com/%s/%s/actions)" % (OWNER, REPO))
-        # wait for the server to come up, refreshing the endpoint as we go
-        for i in range(90):
-            fresh = live_endpoint()
-            if fresh:
-                STATE["endpoint"] = fresh
-            if STATE["endpoint"]:
-                ip = _selftest()
-                if ip:
-                    break
-            if i % 3 == 0:
-                say("    ... waiting for server (%ds)" % (i * 10))
-            time.sleep(10)
-
-    if not STATE["endpoint"]:
-        say("[!] No server endpoint available. Check the Actions tab.")
-        _pause(); return 1
+    # The server always runs (a scheduled/queued GitHub Actions run is kept
+    # live around the clock), so we never dispatch a run or check run status.
+    # Startup must survive a connectivity blip too: remember the last good
+    # endpoint on disk, try ONE quick refresh from GitHub, and otherwise fall
+    # back to the pinned default - never hang in a fetch loop, so we can
+    # connect straight to the server that is already up.
+    load_cache()
+    fresh = live_endpoint()
+    if fresh:
+        STATE["endpoint"] = fresh
+        save_cache()
+    elif STATE["endpoint"]:
+        say("[*] GitHub unreachable - using last known endpoint %s"
+            % STATE["endpoint"])
+    else:
+        STATE["endpoint"] = DEFAULT_ENDPOINT
+        say("[*] GitHub unreachable and no cache - using default %s"
+            % DEFAULT_ENDPOINT)
     say("[+] Server endpoint: %s" % STATE["endpoint"])
+
+    ip = _selftest()
     if ip:
         say("[+] Verified: traffic exits from %s" % ip)
     else:

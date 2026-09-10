@@ -53,9 +53,13 @@ jobs:
           [ -z "$EP" ] && { echo "no endpoint"; cat bore.log; exit 1; }
           echo "ENDPOINT=$EP"; echo "$EP" > /tmp/ep.txt
 
-      - name: Publish endpoint + keep alive (~5h50m), republish on port change
+      - name: Publish endpoint + keep alive (~5h48m), self-restart before the 6h cap
         env:
           PROXY_SECRET: ${{ secrets.PROXY_SECRET }}
+          # PAT with 'workflow' scope (or fine-grained Actions: read+write) on
+          # THIS repo. Needed because a run started by the default GITHUB_TOKEN
+          # cannot trigger another run - so we dispatch the successor with a PAT.
+          DISPATCH_PAT: ${{ secrets.DISPATCH_PAT }}
         run: |
           git config user.name  proxy-bot
           git config user.email proxy-bot@users.noreply.github.com
@@ -73,10 +77,28 @@ jobs:
             echo "published $1"
           }
 
+          # Start the successor run so it is queued and takes over the instant
+          # this job exits (concurrency cancel-in-progress:false keeps us alive
+          # while it waits). Dispatched ~18 min before the 6h hard cap so the
+          # cap can never kill us before the next run is armed.
+          dispatch_next() {
+            if [ -z "$DISPATCH_PAT" ]; then
+              echo "[warn] no DISPATCH_PAT secret - falling back to the 5h schedule only"
+              return
+            fi
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer $DISPATCH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/proxy.yml/dispatches" \
+              -d '{"ref":"main"}')
+            echo "[self-restart] dispatched successor run -> HTTP $code"
+          }
+
           LAST=$(cat /tmp/ep.txt)
           publish "$LAST"
 
-          for i in $(seq 1 350); do
+          armed=0
+          for i in $(seq 1 348); do
             pgrep -f "bore local 2525"  >/dev/null || { echo cf-restart;  nohup ./bore local 2525 --to bore.pub --port 24601 >> bore.log 2>&1 & }
             pgrep -f "tunnel_server.py" >/dev/null || { echo srv-restart; nohup env PROXY_SECRET="$PROXY_SECRET" python3 server/tunnel_server.py 2525 >> srv.log 2>&1 & }
             # if bore reconnected on a different port, republish so clients follow
@@ -84,6 +106,10 @@ jobs:
             if [ -n "$CUR" ] && [ "$CUR" != "$LAST" ]; then
               echo "bore port changed: $LAST -> $CUR"
               publish "$CUR"; LAST="$CUR"
+            fi
+            # arm the next run once, ~18 min before we exit
+            if [ "$i" -eq 330 ] && [ "$armed" -eq 0 ]; then
+              dispatch_next; armed=1
             fi
             sleep 60
           done

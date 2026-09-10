@@ -29,18 +29,8 @@ def main():
     # can't break the source or silently alter the value
     src = src.replace('b"__PROXY_SECRET_PLACEHOLDER__"', repr(secret.encode("utf-8")))
 
-    # optional: bake in a dispatch token so the exe can start a run on its
-    # own when none is active (token_build.txt is gitignored and deleted
-    # by whoever runs this build)
-    tok_path = os.path.join(HERE, "token_build.txt")
-    if os.path.exists(tok_path):
-        token = open(tok_path, encoding="utf-8").read().strip()
-        if token:
-            assert 'DISPATCH_TOKEN = ""' in src, "DISPATCH_TOKEN anchor missing"
-            src = src.replace('DISPATCH_TOKEN = ""', "DISPATCH_TOKEN = %s" % repr(token), 1)
-            print("dispatch token baked in.")
-    else:
-        print("no token_build.txt - building without a dispatch token.")
+    # The client connects straight to the always-on server, so there is no
+    # dispatch token to bake in any more.
 
     built_dir = os.path.join(HERE, "_build_src")
     os.makedirs(built_dir, exist_ok=True)

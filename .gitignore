@@ -1,8 +1,12 @@
 __pycache__/
 *.pyc
 token.txt
+token_build.txt
 secret.txt
 build/
 dist/
 _build_src/
 *.spec
+watchdog.log
+proxy_cache.json
+proxy_cache.json.tmp
