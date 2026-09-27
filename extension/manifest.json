@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Tsoolgee Proxy",
+  "version": "1.0.0",
+  "description": "הפעלה/כיבוי של הפרוקסי המקומי (127.0.0.1:10809) בלחיצה אחת. מוכן לשימוש.",
+  "permissions": ["proxy", "storage"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Tsoolgee Proxy"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

@@ -37,9 +37,13 @@ jobs:
 
       - name: Start tunnel server on :2525
         env:
+          # PROXY_SECRETS: one block per user (SECRET-NAME=... then domains).
+          # PROXY_SECRET: legacy single allow-all secret, used only if
+          # PROXY_SECRETS is unset. Set either one as a repo secret.
           PROXY_SECRET: ${{ secrets.PROXY_SECRET }}
+          PROXY_SECRETS: ${{ secrets.PROXY_SECRETS }}
         run: |
-          nohup env PROXY_SECRET="$PROXY_SECRET" python3 server/tunnel_server.py 2525 > srv.log 2>&1 &
+          nohup env PROXY_SECRET="$PROXY_SECRET" PROXY_SECRETS="$PROXY_SECRETS" python3 server/tunnel_server.py 2525 > srv.log 2>&1 &
           sleep 2
           ss -ltnp 2>/dev/null | grep ':2525' && echo "server up" || { cat srv.log; exit 1; }
 
@@ -56,6 +60,7 @@ jobs:
       - name: Publish endpoint + keep alive (~5h48m), self-restart before the 6h cap
         env:
           PROXY_SECRET: ${{ secrets.PROXY_SECRET }}
+          PROXY_SECRETS: ${{ secrets.PROXY_SECRETS }}
           # PAT with 'workflow' scope (or fine-grained Actions: read+write) on
           # THIS repo. Needed because a run started by the default GITHUB_TOKEN
           # cannot trigger another run - so we dispatch the successor with a PAT.
@@ -100,7 +105,7 @@ jobs:
           armed=0
           for i in $(seq 1 348); do
             pgrep -f "bore local 2525"  >/dev/null || { echo cf-restart;  nohup ./bore local 2525 --to bore.pub --port 24601 >> bore.log 2>&1 & }
-            pgrep -f "tunnel_server.py" >/dev/null || { echo srv-restart; nohup env PROXY_SECRET="$PROXY_SECRET" python3 server/tunnel_server.py 2525 >> srv.log 2>&1 & }
+            pgrep -f "tunnel_server.py" >/dev/null || { echo srv-restart; nohup env PROXY_SECRET="$PROXY_SECRET" PROXY_SECRETS="$PROXY_SECRETS" python3 server/tunnel_server.py 2525 >> srv.log 2>&1 & }
             # if bore reconnected on a different port, republish so clients follow
             CUR=$(grep -oE 'bore\.pub:[0-9]+' bore.log | tail -1)
             if [ -n "$CUR" ] && [ "$CUR" != "$LAST" ]; then

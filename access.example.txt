@@ -1,0 +1,32 @@
+# Proxy access list  (copy to access.txt and edit; access.txt is gitignored)
+# ---------------------------------------------------------------------------
+# One block per user:
+#   SECRET-<NAME>=<value>      opens a user block (NAME is just a label)
+#   <domain>                   a domain this user may reach, one per line
+#   ...more domains...
+#
+# Rules:
+#   * blank lines and lines starting with '#' are ignored
+#   * a domain covers that host AND all its subdomains
+#       youtube.com  ->  youtube.com, www.youtube.com, m.youtube.com, ...
+#   * a block with NO domain lines (or a single line "*") = full access
+#
+# Then:
+#   1) push this list to the server:   gh secret set PROXY_SECRETS < access.txt
+#   2) build each user's client:        python build_exe.py RAFI
+#                                       -> dist/TsoolgeeProxy-RAFI.exe
+
+# Full access - your own token, no restriction
+SECRET-RAFI=754563214586
+
+# YouTube only
+SECRET-YEHUDA=change-me-to-a-long-random-value
+youtube.com
+googlevideo.com
+ytimg.com
+ggpht.com
+
+# Wikipedia only
+SECRET-MOSHE=another-long-random-value
+wikipedia.org
+wikimedia.org

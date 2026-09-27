@@ -10,3 +10,6 @@ _build_src/
 watchdog.log
 proxy_cache.json
 proxy_cache.json.tmp
+secret2.txt
+access.txt
+dist_users/
