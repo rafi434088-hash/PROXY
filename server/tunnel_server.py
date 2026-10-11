@@ -42,7 +42,9 @@ BANNER = b"220 mx.tsoolgee.uk ESMTP Postfix (Ubuntu)\r\n"
 AUTH_WINDOW = 300
 HANDSHAKE_TIMEOUT = 20      # slowloris guard: the SMTP+key phase must be quick
 RELAY_IDLE = 1800           # generous: don't kill idle keepalive/websocket conns
-MAX_CONNS = 256
+# High enough for several heavy users at once (each page opens dozens of
+# connections). The fd limit is raised to match in main().
+MAX_CONNS = 2000
 
 
 def _keepalive(sock):
@@ -348,11 +350,26 @@ def handle(conn, addr):
         _sem.release()
 
 
+def _raise_fd_limit():
+    """Lift the open-file limit so many concurrent connections (2 fds each)
+    don't hit EMFILE and take the accept loop down. No-op on Windows."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = 16384 if hard == resource.RLIM_INFINITY else min(hard, 16384)
+        if want > soft:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+            log("fd limit raised to %d" % want)
+    except Exception as e:
+        log("fd limit unchanged: %s" % e)
+
+
 def main():
+    _raise_fd_limit()
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", PORT))
-    srv.listen(128)
+    srv.listen(256)
     insecure = len(USERS) == 1 and USERS[0]["secret"] == b"dev-insecure-secret"
     if insecure:
         log("tunnel server on 127.0.0.1:%d - NO SECRET SET (dev fallback)!" % PORT)
@@ -363,8 +380,22 @@ def main():
         log("tunnel server on 127.0.0.1:%d - %d user(s): %s"
             % (PORT, len(USERS), summary))
     while True:
-        conn, addr = srv.accept()
-        _sem.acquire()
+        # The accept loop must NEVER die - one bad accept (EMFILE under load,
+        # ECONNABORTED, etc.) used to crash the whole server and drop everyone.
+        try:
+            conn, addr = srv.accept()
+        except OSError as e:
+            log("accept error (continuing): %s" % e)
+            time.sleep(0.1)
+            continue
+        # Cap concurrency; if we're truly saturated, shed this one connection
+        # (the browser just retries) rather than stall the whole accept loop.
+        if not _sem.acquire(timeout=20):
+            try:
+                conn.close()
+            except OSError:
+                pass
+            continue
         try:
             threading.Thread(target=handle, args=(conn, addr), daemon=True).start()
         except RuntimeError:                 # thread/resource exhaustion
