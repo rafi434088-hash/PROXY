@@ -102,16 +102,61 @@ jobs:
           LAST=$(cat /tmp/ep.txt)
           publish "$LAST"
 
+          # End-to-end health probe: connect THROUGH bore.pub and require the
+          # real ESMTP banner. This catches the failure we actually hit - the
+          # bore process stays alive but bore.pub silently stops forwarding on
+          # the port, so pgrep sees "all fine" while clients get an instant
+          # close. $1 is "host:port".
+          healthy() {
+            # $1 = host:port. Up to 3 quick tries; OK only if the ESMTP banner
+            # actually arrives. Retries live in bash so the python stays a
+            # single YAML-safe line (no multi-line literal to break indent).
+            h=${1%:*}; p=${1##*:}
+            for _ in 1 2 3; do
+              python3 -c 'import socket,sys; s=socket.create_connection((sys.argv[1],int(sys.argv[2])),timeout=6); s.settimeout(6); sys.exit(0 if s.recv(8).startswith(b"220") else 1)' "$h" "$p" && return 0
+              sleep 2
+            done
+            return 1
+          }
+
+          current_port() { grep -oE 'bore\.pub:[0-9]+' bore.log | tail -1; }
+
+          # Kill and relaunch bore, then wait for it to log a FRESH endpoint
+          # line. Count-based so even a reused same port counts as recovered.
+          restart_bore() {
+            echo "[health] restarting bore"
+            PRE=$(grep -cE 'bore\.pub:[0-9]+' bore.log 2>/dev/null || echo 0)
+            pkill -f "bore local 2525" 2>/dev/null || true
+            sleep 2
+            nohup ./bore local 2525 --to bore.pub --port 24601 >> bore.log 2>&1 &
+            for _ in $(seq 1 25); do
+              NOW=$(grep -cE 'bore\.pub:[0-9]+' bore.log 2>/dev/null || echo 0)
+              [ "$NOW" -gt "$PRE" ] && break
+              sleep 1
+            done
+          }
+
           armed=0
           for i in $(seq 1 348); do
-            pgrep -f "bore local 2525"  >/dev/null || { echo cf-restart;  nohup ./bore local 2525 --to bore.pub --port 24601 >> bore.log 2>&1 & }
-            pgrep -f "tunnel_server.py" >/dev/null || { echo srv-restart; nohup env PROXY_SECRET="$PROXY_SECRET" PROXY_SECRETS="$PROXY_SECRETS" python3 server/tunnel_server.py 2525 >> srv.log 2>&1 & }
-            # if bore reconnected on a different port, republish so clients follow
-            CUR=$(grep -oE 'bore\.pub:[0-9]+' bore.log | tail -1)
+            # local server must be up (the tunnel can't be healthy without it)
+            pgrep -f "tunnel_server.py" >/dev/null || { echo srv-restart; nohup env PROXY_SECRET="$PROXY_SECRET" PROXY_SECRETS="$PROXY_SECRETS" python3 server/tunnel_server.py 2525 >> srv.log 2>&1 & sleep 2; }
+            # bore process must be up
+            pgrep -f "bore local 2525" >/dev/null || { echo cf-restart; nohup ./bore local 2525 --to bore.pub --port 24601 >> bore.log 2>&1 & sleep 3; }
+
+            CUR=$(current_port)
+            # the real test: is the published endpoint actually serving?
+            if [ -z "$CUR" ] || ! healthy "$CUR"; then
+              echo "[health] tunnel unhealthy (CUR=$CUR) - healing"
+              restart_bore
+              CUR=$(current_port)
+            fi
+
+            # republish whatever port is live now so clients follow
             if [ -n "$CUR" ] && [ "$CUR" != "$LAST" ]; then
-              echo "bore port changed: $LAST -> $CUR"
+              echo "endpoint changed: $LAST -> $CUR"
               publish "$CUR"; LAST="$CUR"
             fi
+
             # arm the next run once, ~18 min before we exit
             if [ "$i" -eq 330 ] && [ "$armed" -eq 0 ]; then
               dispatch_next; armed=1
