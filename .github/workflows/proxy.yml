@@ -10,10 +10,14 @@ on:
 
 concurrency:
   group: proxy-server
-  # false, so a new run QUEUES behind the running server instead of
-  # killing it. The old run keeps serving until it ends (~5h50m), then
-  # the queued run takes over - near-continuous, no restart gaps.
-  cancel-in-progress: false
+  # true, so a new run CANCELS the current one and takes over. We used to
+  # queue (false) for gap-free handover, but that caused a deadlock: when a
+  # run's tunnel died while its bore process stayed alive, it kept holding
+  # the pinned bore.pub port, and the queued successor failed with
+  # "port already in use" - so a dead run blocked every recovery until its
+  # ~6h loop ended. Cancelling frees the port immediately; the ~30-60s
+  # startup gap on handover is far cheaper than a multi-hour dead tunnel.
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -49,10 +53,31 @@ jobs:
 
       - name: Open bore tunnel
         run: |
-          nohup ./bore local 2525 --to bore.pub --port 24601 > bore.log 2>&1 &
-          for i in $(seq 1 30); do
-            EP=$(grep -oE 'bore\.pub:[0-9]+' bore.log | head -1)
-            [ -n "$EP" ] && break; sleep 1
+          # Try the pinned port first (clients that can't read GitHub default
+          # to it). A just-cancelled predecessor can hold it for a few seconds,
+          # so retry on "port already in use"; as a last resort take whatever
+          # port bore assigns and publish that (GitHub-reachable clients follow).
+          start_bore() {
+            : > bore.log
+            if [ -n "$1" ]; then
+              nohup ./bore local 2525 --to bore.pub --port "$1" >> bore.log 2>&1 &
+            else
+              nohup ./bore local 2525 --to bore.pub >> bore.log 2>&1 &
+            fi
+          }
+          EP=""
+          for attempt in 1 2 3 4 5 6; do
+            if [ "$attempt" -le 5 ]; then start_bore 24601; else start_bore ""; fi
+            for i in $(seq 1 15); do
+              EP=$(grep -oE 'bore\.pub:[0-9]+' bore.log | head -1)
+              [ -n "$EP" ] && break
+              grep -qi 'in use\|error' bore.log && break
+              sleep 1
+            done
+            [ -n "$EP" ] && break
+            echo "attempt $attempt failed: $(tail -1 bore.log)"
+            pkill -f 'bore local 2525' 2>/dev/null || true
+            sleep 5
           done
           [ -z "$EP" ] && { echo "no endpoint"; cat bore.log; exit 1; }
           echo "ENDPOINT=$EP"; echo "$EP" > /tmp/ep.txt
@@ -128,7 +153,9 @@ jobs:
             PRE=$(grep -cE 'bore\.pub:[0-9]+' bore.log 2>/dev/null || echo 0)
             pkill -f "bore local 2525" 2>/dev/null || true
             sleep 2
-            nohup ./bore local 2525 --to bore.pub --port 24601 >> bore.log 2>&1 &
+            # reclaim the SAME port we are currently published on (not a
+            # hardcoded 24601) - the open step may have fallen back to another.
+            nohup ./bore local 2525 --to bore.pub --port "${LAST##*:}" >> bore.log 2>&1 &
             for _ in $(seq 1 25); do
               NOW=$(grep -cE 'bore\.pub:[0-9]+' bore.log 2>/dev/null || echo 0)
               [ "$NOW" -gt "$PRE" ] && break
@@ -141,7 +168,7 @@ jobs:
             # local server must be up (the tunnel can't be healthy without it)
             pgrep -f "tunnel_server.py" >/dev/null || { echo srv-restart; nohup env PROXY_SECRET="$PROXY_SECRET" PROXY_SECRETS="$PROXY_SECRETS" python3 server/tunnel_server.py 2525 >> srv.log 2>&1 & sleep 2; }
             # bore process must be up
-            pgrep -f "bore local 2525" >/dev/null || { echo cf-restart; nohup ./bore local 2525 --to bore.pub --port 24601 >> bore.log 2>&1 & sleep 3; }
+            pgrep -f "bore local 2525" >/dev/null || { echo cf-restart; nohup ./bore local 2525 --to bore.pub --port "${LAST##*:}" >> bore.log 2>&1 & sleep 3; }
 
             CUR=$(current_port)
             # the real test: is the published endpoint actually serving?
