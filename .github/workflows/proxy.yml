@@ -51,36 +51,35 @@ jobs:
           sleep 2
           ss -ltnp 2>/dev/null | grep ':2525' && echo "server up" || { cat srv.log; exit 1; }
 
-      - name: Open bore tunnel
+      - name: Open bore tunnel (pinned port 24601 only)
         run: |
-          # Try the pinned port first (clients that can't read GitHub default
-          # to it). A just-cancelled predecessor can hold it for a few seconds,
-          # so retry on "port already in use"; as a last resort take whatever
-          # port bore assigns and publish that (GitHub-reachable clients follow).
-          start_bore() {
+          # The client is pinned to bore.pub:24601 and, behind the filter,
+          # cannot learn any other port - so 24601 is the ONLY acceptable
+          # endpoint; we never fall back to a random one (it would be useless
+          # to the client). bore.pub can briefly hold 24601 after a predecessor
+          # is cancelled ("port already in use"); we just wait and retry until
+          # it frees. cancel-in-progress guarantees no sibling run holds it for
+          # long, so the wait is short in practice (bore.pub frees it in ~1-5m).
+          get_tunnel() {
             : > bore.log
-            if [ -n "$1" ]; then
-              nohup ./bore local 2525 --to bore.pub --port "$1" >> bore.log 2>&1 &
-            else
-              nohup ./bore local 2525 --to bore.pub >> bore.log 2>&1 &
-            fi
-          }
-          EP=""
-          for attempt in 1 2 3 4 5 6; do
-            if [ "$attempt" -le 5 ]; then start_bore 24601; else start_bore ""; fi
-            for i in $(seq 1 15); do
-              EP=$(grep -oE 'bore\.pub:[0-9]+' bore.log | head -1)
-              [ -n "$EP" ] && break
-              grep -qi 'in use\|error' bore.log && break
+            nohup ./bore local 2525 --to bore.pub --port 24601 >> bore.log 2>&1 &
+            for i in $(seq 1 20); do
+              grep -qE 'bore\.pub:24601' bore.log && return 0
+              grep -qiE 'in use|error' bore.log && return 1
               sleep 1
             done
-            [ -n "$EP" ] && break
-            echo "attempt $attempt failed: $(tail -1 bore.log)"
+            return 1
+          }
+          ok=0
+          # ~20 tries over ~20 min - far longer than bore.pub's usual release.
+          for attempt in $(seq 1 20); do
+            if get_tunnel; then ok=1; break; fi
+            echo "attempt $attempt: 24601 not free yet - $(tail -1 bore.log)"
             pkill -f 'bore local 2525' 2>/dev/null || true
-            sleep 5
+            sleep 40
           done
-          [ -z "$EP" ] && { echo "no endpoint"; cat bore.log; exit 1; }
-          echo "ENDPOINT=$EP"; echo "$EP" > /tmp/ep.txt
+          [ "$ok" -ne 1 ] && { echo "could not bind 24601"; cat bore.log; exit 1; }
+          echo "ENDPOINT=bore.pub:24601"; echo "bore.pub:24601" > /tmp/ep.txt
 
       - name: Publish endpoint + keep alive (~5h48m), self-restart before the 6h cap
         env:
@@ -153,9 +152,8 @@ jobs:
             PRE=$(grep -cE 'bore\.pub:[0-9]+' bore.log 2>/dev/null || echo 0)
             pkill -f "bore local 2525" 2>/dev/null || true
             sleep 2
-            # reclaim the SAME port we are currently published on (not a
-            # hardcoded 24601) - the open step may have fallen back to another.
-            nohup ./bore local 2525 --to bore.pub --port "${LAST##*:}" >> bore.log 2>&1 &
+            # always reclaim 24601 - the only port the pinned client can use.
+            nohup ./bore local 2525 --to bore.pub --port 24601 >> bore.log 2>&1 &
             for _ in $(seq 1 25); do
               NOW=$(grep -cE 'bore\.pub:[0-9]+' bore.log 2>/dev/null || echo 0)
               [ "$NOW" -gt "$PRE" ] && break
@@ -168,7 +166,7 @@ jobs:
             # local server must be up (the tunnel can't be healthy without it)
             pgrep -f "tunnel_server.py" >/dev/null || { echo srv-restart; nohup env PROXY_SECRET="$PROXY_SECRET" PROXY_SECRETS="$PROXY_SECRETS" python3 server/tunnel_server.py 2525 >> srv.log 2>&1 & sleep 2; }
             # bore process must be up
-            pgrep -f "bore local 2525" >/dev/null || { echo cf-restart; nohup ./bore local 2525 --to bore.pub --port "${LAST##*:}" >> bore.log 2>&1 & sleep 3; }
+            pgrep -f "bore local 2525" >/dev/null || { echo cf-restart; nohup ./bore local 2525 --to bore.pub --port 24601 >> bore.log 2>&1 & sleep 3; }
 
             CUR=$(current_port)
             # the real test: is the published endpoint actually serving?
